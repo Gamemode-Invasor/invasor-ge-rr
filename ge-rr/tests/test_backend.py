@@ -3,6 +3,7 @@ import logging
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -32,23 +33,60 @@ class Unavailable(RuntimeError):
     pass
 
 
+class FakeEvents:
+    def __init__(self, cbs):
+        self.cbs = cbs
+
+    def on(self, name, cb):
+        self.cbs.setdefault(name, []).append(cb)
+
+    def off(self, name, cb):
+        if cb in self.cbs.get(name, []):
+            self.cbs[name].remove(cb)
+
+
+class FakeTask:
+    def __init__(self, label):
+        self.label, self.updates, self.end = label, [], None
+
+    def update(self, fraction, text=""):
+        if not self.end:
+            self.updates.append((fraction, text))
+
+    def done(self, text=""):
+        self.end = self.end or ("done", text)
+
+    def fail(self, text=""):
+        self.end = self.end or ("fail", text)
+
+
 class FakeCtx:
     InvalidArgument = InvalidArgument
     Unavailable = Unavailable
 
     def __init__(self):
         self.log = logging.getLogger("test.ge_rr")
-        self.steam_start_cbs = []
+        self.cbs = {}
+        self.game = types.SimpleNamespace(running=None)
+        self.sounds = []
+        self.tasks = []
+        self.task_ok = True
+        self.events = FakeEvents(self.cbs)
         self.notes = []
         self.notify_ok = True
 
-    def on_steam_start(self, cb):
-        self.steam_start_cbs.append(cb)
+    def task(self, label):
+        if not self.task_ok:
+            raise Unavailable("module unloaded")
+        t = FakeTask(label)
+        self.tasks.append(t)
+        return t
 
-    def notify(self, title, body=""):
+    def notify(self, title, body="", icon="", timeout=15, sound=""):
         if not self.notify_ok:
             raise Unavailable("no Steam")
         self.notes.append((title, body))
+        self.sounds.append(sound)
 
 
 class Backend(unittest.TestCase):
@@ -90,7 +128,8 @@ class Backend(unittest.TestCase):
         return top
 
     def test_registers_steam_start(self):
-        self.assertEqual(self.ctx.steam_start_cbs, [self.b.auto_update])
+        self.assertEqual(self.ctx.cbs, {"steam_start": [self.b.auto_update], "game_started": [self.b._game_started],
+                                          "game_stopped": [self.b._game_stopped]})
 
     def test_auto_update_installs_and_notifies(self):
         with self.assertLogs("test.ge_rr", "INFO"):
@@ -104,6 +143,39 @@ class Backend(unittest.TestCase):
         self.assertIn("Restart Steam", self.ctx.notes[1][1])
         self.assertEqual([p.name for p in self.cache.iterdir()], ["lock"])  # no work folder left
         self.assertFalse(self.b._lock.locked())
+
+    def test_download_shows_a_task(self):
+        self.b.auto_update()
+        (t,) = self.ctx.tasks
+        self.assertEqual(t.label, "GE-Proton GE-Proton11-7")
+        self.assertEqual(t.updates[0], (0, "Downloading"))
+        self.assertIn((1.0, "Downloading 0/0 MB"), t.updates)
+        self.assertEqual([x for _, x in t.updates][-3:], ["Verifying", "Extracting", "Installing"])
+        self.assertEqual(t.end, ("done", "Installed. Restart Steam to load it"))
+
+    def test_failed_download_fails_the_task(self):
+        self.b.geproton.verify.side_effect = self.b.geproton.Error("The download is corrupt")
+        with self.assertLogs("test.ge_rr", "INFO"):
+            self.b.auto_update()
+        self.assertEqual(self.ctx.tasks[0].end, ("fail", "The download is corrupt"))
+
+    def test_cancelled_download_fails_the_task(self):
+        self.b.geproton.download.side_effect = self.b.geproton.Cancelled("Cancelled")
+        self.b.auto_update()
+        self.assertEqual(self.ctx.tasks[0].end, ("fail", "Cancelled"))
+
+    def test_up_to_date_shows_no_task(self):
+        self.b.auto_update()
+        self.ctx.tasks.clear()
+        self.b.auto_update()
+        self.assertEqual(self.ctx.tasks, [])
+
+    def test_task_plan_b(self):
+        self.ctx.task_ok = False
+        with self.assertLogs("test.ge_rr", "INFO") as logs:
+            self.b.auto_update()
+        self.assertEqual(self.b.status()["phase"], "done")
+        self.assertTrue(any("task not shown" in line for line in logs.output))
 
     def test_up_to_date_does_nothing(self):
         self.b.auto_update()
@@ -137,6 +209,49 @@ class Backend(unittest.TestCase):
         self.b.reinstall()  # forced
         self._wait_job()
         self.assertEqual(self.b.geproton.download.call_count, 2)
+        self.assertEqual(self.b.status()["phase"], "done")
+
+    GAME = {"appid": "1", "name": "G", "shortcut": False}
+
+    def test_game_defers_auto_update_until_it_stops(self):
+        self.ctx.game.running = self.GAME
+        self.b.auto_update()
+        self.b.geproton.download.assert_not_called()
+        s = self.b.status()
+        self.assertTrue(s["pending"] and s["game_running"])
+        self.ctx.game.running = None
+        self.b._game_stopped(self.GAME)
+        self.assertEqual(self.b.geproton.download.call_count, 1)
+        s = self.b.status()
+        self.assertEqual((s["phase"], s["pending"]), ("done", False))
+
+    def test_game_stopped_without_pending_does_nothing(self):
+        self.b._game_stopped(self.GAME)
+        self.b.geproton.download.assert_not_called()
+
+    def test_game_blocks_the_buttons(self):
+        self.ctx.game.running = self.GAME
+        for call in (self.b.download, self.b.reinstall):
+            self.assertEqual(call(), {"started": False, "busy": False, "game": True})
+        self.b.geproton.download.assert_not_called()
+        self.assertFalse(self.b._lock.locked())
+
+    def test_game_start_pauses_auto_download(self):
+        def download(url, dest, size, progress=None, cancel=None):
+            self.ctx.game.running = self.GAME
+            self.b._game_started(self.GAME)
+            self.assertTrue(cancel.is_set())
+            raise self.b.geproton.Cancelled("Cancelled")
+
+        self.b.geproton.download.side_effect = download
+        self.b.auto_update()
+        s = self.b.status()
+        self.assertEqual((s["phase"], s["pending"]), ("idle", True))
+        self.assertEqual(self.ctx.tasks[0].end, ("fail", "Paused: a game is running"))
+        self.assertFalse(self.b._lock.locked())
+        self.b.geproton.download.side_effect = self._download
+        self.ctx.game.running = None
+        self.b._game_stopped(self.GAME)
         self.assertEqual(self.b.status()["phase"], "done")
 
     def test_busy(self):

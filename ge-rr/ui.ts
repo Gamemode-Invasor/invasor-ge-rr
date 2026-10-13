@@ -22,6 +22,8 @@ interface Status {
   installed: { tag: string | null; url: string | null } | null;
   busy: boolean;
   update_available: boolean;
+  game_running: boolean;
+  pending: boolean;
 }
 
 const errorText = (e: unknown) => String((e as Error)?.message ?? e);
@@ -93,8 +95,9 @@ function renderMain(el: HTMLElement, ctx: ModuleCtx) {
 
   async function start(method: "download" | "reinstall") {
     try {
-      const r = await ctx.call<{ started: boolean; busy: boolean }>(method);
-      if (r.busy) ctx.toast("GE-Proton is already being updated");
+      const r = await ctx.call<{ started: boolean; busy: boolean; game?: boolean }>(method);
+      if (r.game) ctx.toast("A game is running: try again when it ends");
+      else if (r.busy) ctx.toast("GE-Proton is already being updated");
     } catch (e) {
       ctx.toast(errorText(e), "error");
     }
@@ -112,14 +115,16 @@ function renderMain(el: HTMLElement, ctx: ModuleCtx) {
         ? `${s.latest.tag} is available (${mb(s.latest.size)})${when}`
         : `Up to date: ${s.latest.tag} is the latest${when}`;
     }
-    progressInfo.textContent = phaseText(s);
+    progressInfo.textContent =
+      phaseText(s) || (s.pending ? "Update postponed until the game ends." : "");
     progressInfo.style.display = progressInfo.textContent ? "" : "none";
     restartInfo.style.display = s.restart ? "" : "none";
     check.setDisabled(s.busy, s.busy ? "Busy updating" : undefined);
-    reinstall.setDisabled(s.busy, s.busy ? "Busy updating" : undefined);
+    const why = s.busy ? "Busy updating" : s.game_running ? "A game is running" : undefined;
+    reinstall.setDisabled(s.busy || s.game_running, why);
     download.setDisabled(
-      s.busy || !s.update_available,
-      s.busy ? "Busy updating" : "Check for updates first, or restart Steam to update",
+      s.busy || s.game_running || !s.update_available,
+      why ?? "Check for updates first, or restart Steam to update",
     );
   }
 
@@ -145,7 +150,7 @@ function renderMain(el: HTMLElement, ctx: ModuleCtx) {
     download,
     reinstall,
     ui.separator(),
-    ui.info("GE-Proton is checked and updated by itself every time Steam starts."),
+    ui.info("GE-Proton is checked and updated by itself every time Steam starts, never while a game is running."),
     ui.info("Uninstalling this module and also deleting its data deletes GE-Proton too."),
   );
   void refresh(); // polling while busy starts with the sub-tab's onShow
