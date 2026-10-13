@@ -6,6 +6,8 @@ to "GE-Proton" always runs the newest one: no more picking a new version in each
 
 - **When:** every time Steam starts or restarts (also when switching between Desktop and Game Mode), and when Invasor
   starts with Steam already running. If there's no network yet, it tries again for a minute.
+  Never while a game is running: the automatic update waits until the game stops (and pauses if a game starts
+  during the download), and the Download/Reinstall buttons are disabled meanwhile.
 - **What it downloads:** the latest GE-Proton release from its official GitHub page, built for this machine's
   architecture (`x86_64` or `aarch64`, detected automatically).
 - **Checks:** the download must match the release's `.sha512sum` (or GitHub's sha256 digest if that file can't be

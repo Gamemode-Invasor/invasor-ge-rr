@@ -1,7 +1,8 @@
 {
   "api": 1,
   "name": "GE-Proton Rolling Release",
-  "version": "0.2.0",
+  "version": "0.2.1",
+  "min_core": "0.2.0",
   "author": "FranjeGueje",
   "description": "Keeps the latest GE-Proton installed as a single \"GE-Proton\" compatibility tool, checked every time Steam starts.",
   "tab": "GE-RR",
