@@ -71,6 +71,25 @@ def _notify(title, body):
         ctx.log.warning("notification not shown: %s", e)  # plan B: the log
 
 
+def _task(label):
+    """The download in the Tasks panel (besides the notifications); None if it can't be shown."""
+    try:
+        return ctx.task(label)
+    except ctx.Unavailable as e:
+        ctx.log.warning("task not shown: %s", e)
+        return None
+
+
+def _task_update(task, fraction, text):
+    if task:
+        task.update(fraction, text)
+
+
+def _task_end(task, ok, text):
+    if task:
+        (task.done if ok else task.fail)(text)
+
+
 def _latest(stop, retry=False):
     tries = NET_TRIES if retry else 1
     for i in range(tries):
@@ -90,6 +109,7 @@ def _job(stop, force, auto):
     root = _root()
     lock = geproton.JobLock()
     work = None
+    task = None
     try:
         _set(phase="checking", error=None, done=0, total=0)
         if not lock.acquire(stop, wait=LOCK_WAIT):
@@ -112,33 +132,53 @@ def _job(stop, force, auto):
         _set(phase="downloading", tag=latest["tag"], total=latest["size"])
         started = True
         _notify("Downloading GE-Proton", f"{latest['tag']} ({latest['size'] >> 20} MB)")
+        task = _task(f"GE-Proton {latest['tag']}")
+        _task_update(task, 0, "Downloading")
+        percent = [-1]
+
+        def progress(done, total):
+            _set(done=done, total=total)
+            pc = done * 100 // total if total else -1
+            if pc != percent[0]:  # one update per percent, not per chunk
+                percent[0] = pc
+                _task_update(task, done / total if total else None,
+                             f"Downloading {done >> 20}/{total >> 20} MB" if total else "Downloading")
+
         archive = work / "GE-Proton.tar.gz"
         sha512, sha256 = geproton.download(latest["url"], archive, latest["size"],
-                                           progress=lambda d, t: _set(done=d, total=t), cancel=stop)
+                                           progress=progress, cancel=stop)
         _set(phase="verifying")
+        _task_update(task, None, "Verifying")
         how = geproton.verify(latest, sha512, sha256)
         ctx.log.info("checksum OK (%s)", how)
         _set(phase="extracting")
+        _task_update(task, None, "Extracting")
         extracted = geproton.extract(archive, work / "extract", cancel=stop)
         archive.unlink()
         _set(phase="installing")
+        _task_update(task, None, "Installing")
         geproton.install(extracted, root, latest)
         ctx.log.info("installed %s in %s", latest["tag"], root / geproton.TOOL)
         _set(phase="done", restart=True)
+        _task_end(task, True, "Installed. Restart Steam to load it")
         _notify("GE-Proton installed", f"{latest['tag']} is installed. Restart Steam to load it.")
     except geproton.Cancelled:
         _set(phase="idle")
+        _task_end(task, False, "Cancelled")
     except geproton.Error as e:
         ctx.log.warning("%s", e)
         _set(phase="error", error=str(e))
+        _task_end(task, False, str(e))
         if started:  # no toast for a check that failed at boot (e.g. no network)
             _notify("GE-Proton update failed", str(e))
     except Exception as e:
         ctx.log.exception("update failed")
         _set(phase="error", error=str(e))
+        _task_end(task, False, str(e))
         if started:
             _notify("GE-Proton update failed", str(e))
     finally:
+        _task_end(task, False, "Interrupted")  # no-op if it already ended
         if work is not None:
             geproton.remove(work)  # only this update's own folder
         lock.release()

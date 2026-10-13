@@ -45,6 +45,21 @@ class FakeEvents:
             self.steam_start_cbs.remove(cb)
 
 
+class FakeTask:
+    def __init__(self, label):
+        self.label, self.updates, self.end = label, [], None
+
+    def update(self, fraction, text=""):
+        if not self.end:
+            self.updates.append((fraction, text))
+
+    def done(self, text=""):
+        self.end = self.end or ("done", text)
+
+    def fail(self, text=""):
+        self.end = self.end or ("fail", text)
+
+
 class FakeCtx:
     InvalidArgument = InvalidArgument
     Unavailable = Unavailable
@@ -53,9 +68,18 @@ class FakeCtx:
         self.log = logging.getLogger("test.ge_rr")
         self.steam_start_cbs = []
         self.sounds = []
+        self.tasks = []
+        self.task_ok = True
         self.events = FakeEvents(self.steam_start_cbs)
         self.notes = []
         self.notify_ok = True
+
+    def task(self, label):
+        if not self.task_ok:
+            raise Unavailable("module unloaded")
+        t = FakeTask(label)
+        self.tasks.append(t)
+        return t
 
     def notify(self, title, body="", icon="", timeout=15, sound=""):
         if not self.notify_ok:
@@ -117,6 +141,39 @@ class Backend(unittest.TestCase):
         self.assertIn("Restart Steam", self.ctx.notes[1][1])
         self.assertEqual([p.name for p in self.cache.iterdir()], ["lock"])  # no work folder left
         self.assertFalse(self.b._lock.locked())
+
+    def test_download_shows_a_task(self):
+        self.b.auto_update()
+        (t,) = self.ctx.tasks
+        self.assertEqual(t.label, "GE-Proton GE-Proton11-7")
+        self.assertEqual(t.updates[0], (0, "Downloading"))
+        self.assertIn((1.0, "Downloading 0/0 MB"), t.updates)
+        self.assertEqual([x for _, x in t.updates][-3:], ["Verifying", "Extracting", "Installing"])
+        self.assertEqual(t.end, ("done", "Installed. Restart Steam to load it"))
+
+    def test_failed_download_fails_the_task(self):
+        self.b.geproton.verify.side_effect = self.b.geproton.Error("The download is corrupt")
+        with self.assertLogs("test.ge_rr", "INFO"):
+            self.b.auto_update()
+        self.assertEqual(self.ctx.tasks[0].end, ("fail", "The download is corrupt"))
+
+    def test_cancelled_download_fails_the_task(self):
+        self.b.geproton.download.side_effect = self.b.geproton.Cancelled("Cancelled")
+        self.b.auto_update()
+        self.assertEqual(self.ctx.tasks[0].end, ("fail", "Cancelled"))
+
+    def test_up_to_date_shows_no_task(self):
+        self.b.auto_update()
+        self.ctx.tasks.clear()
+        self.b.auto_update()
+        self.assertEqual(self.ctx.tasks, [])
+
+    def test_task_plan_b(self):
+        self.ctx.task_ok = False
+        with self.assertLogs("test.ge_rr", "INFO") as logs:
+            self.b.auto_update()
+        self.assertEqual(self.b.status()["phase"], "done")
+        self.assertTrue(any("task not shown" in line for line in logs.output))
 
     def test_up_to_date_does_nothing(self):
         self.b.auto_update()
