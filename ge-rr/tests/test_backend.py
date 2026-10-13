@@ -3,6 +3,7 @@ import logging
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -33,16 +34,15 @@ class Unavailable(RuntimeError):
 
 
 class FakeEvents:
-    def __init__(self, steam_start_cbs):
-        self.steam_start_cbs = steam_start_cbs
+    def __init__(self, cbs):
+        self.cbs = cbs
 
     def on(self, name, cb):
-        if name == "steam_start":
-            self.steam_start_cbs.append(cb)
+        self.cbs.setdefault(name, []).append(cb)
 
     def off(self, name, cb):
-        if name == "steam_start" and cb in self.steam_start_cbs:
-            self.steam_start_cbs.remove(cb)
+        if cb in self.cbs.get(name, []):
+            self.cbs[name].remove(cb)
 
 
 class FakeTask:
@@ -66,11 +66,12 @@ class FakeCtx:
 
     def __init__(self):
         self.log = logging.getLogger("test.ge_rr")
-        self.steam_start_cbs = []
+        self.cbs = {}
+        self.game = types.SimpleNamespace(running=None)
         self.sounds = []
         self.tasks = []
         self.task_ok = True
-        self.events = FakeEvents(self.steam_start_cbs)
+        self.events = FakeEvents(self.cbs)
         self.notes = []
         self.notify_ok = True
 
@@ -127,7 +128,8 @@ class Backend(unittest.TestCase):
         return top
 
     def test_registers_steam_start(self):
-        self.assertEqual(self.ctx.steam_start_cbs, [self.b.auto_update])
+        self.assertEqual(self.ctx.cbs, {"steam_start": [self.b.auto_update], "game_started": [self.b._game_started],
+                                          "game_stopped": [self.b._game_stopped]})
 
     def test_auto_update_installs_and_notifies(self):
         with self.assertLogs("test.ge_rr", "INFO"):
@@ -207,6 +209,49 @@ class Backend(unittest.TestCase):
         self.b.reinstall()  # forced
         self._wait_job()
         self.assertEqual(self.b.geproton.download.call_count, 2)
+        self.assertEqual(self.b.status()["phase"], "done")
+
+    GAME = {"appid": "1", "name": "G", "shortcut": False}
+
+    def test_game_defers_auto_update_until_it_stops(self):
+        self.ctx.game.running = self.GAME
+        self.b.auto_update()
+        self.b.geproton.download.assert_not_called()
+        s = self.b.status()
+        self.assertTrue(s["pending"] and s["game_running"])
+        self.ctx.game.running = None
+        self.b._game_stopped(self.GAME)
+        self.assertEqual(self.b.geproton.download.call_count, 1)
+        s = self.b.status()
+        self.assertEqual((s["phase"], s["pending"]), ("done", False))
+
+    def test_game_stopped_without_pending_does_nothing(self):
+        self.b._game_stopped(self.GAME)
+        self.b.geproton.download.assert_not_called()
+
+    def test_game_blocks_the_buttons(self):
+        self.ctx.game.running = self.GAME
+        for call in (self.b.download, self.b.reinstall):
+            self.assertEqual(call(), {"started": False, "busy": False, "game": True})
+        self.b.geproton.download.assert_not_called()
+        self.assertFalse(self.b._lock.locked())
+
+    def test_game_start_pauses_auto_download(self):
+        def download(url, dest, size, progress=None, cancel=None):
+            self.ctx.game.running = self.GAME
+            self.b._game_started(self.GAME)
+            self.assertTrue(cancel.is_set())
+            raise self.b.geproton.Cancelled("Cancelled")
+
+        self.b.geproton.download.side_effect = download
+        self.b.auto_update()
+        s = self.b.status()
+        self.assertEqual((s["phase"], s["pending"]), ("idle", True))
+        self.assertEqual(self.ctx.tasks[0].end, ("fail", "Paused: a game is running"))
+        self.assertFalse(self.b._lock.locked())
+        self.b.geproton.download.side_effect = self._download
+        self.ctx.game.running = None
+        self.b._game_stopped(self.GAME)
         self.assertEqual(self.b.status()["phase"], "done")
 
     def test_busy(self):
