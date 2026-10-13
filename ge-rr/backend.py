@@ -41,7 +41,7 @@ def setup(context):
     ctx = context
     _stop = threading.Event()
     _reset_state()
-    ctx.on_steam_start(auto_update)
+    ctx.events.on("steam_start", auto_update)
 
 
 def teardown():
@@ -66,7 +66,7 @@ def uninstall(context, purge):
 
 def _notify(title, body):
     try:
-        ctx.notify(title, body)
+        ctx.notify(title, body, sound="toast")
     except (ctx.Unavailable, ctx.InvalidArgument) as e:
         ctx.log.warning("notification not shown: %s", e)  # plan B: the log
 
@@ -145,7 +145,7 @@ def _job(stop, force, auto):
         _lock.release()
 
 
-def auto_update():
+def auto_update(payload=None):
     """A new Steam instance: it has loaded whatever is installed, so no restart is pending."""
     _set(restart=False)
     if not _lock.acquire(blocking=False):

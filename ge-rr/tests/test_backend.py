@@ -32,6 +32,19 @@ class Unavailable(RuntimeError):
     pass
 
 
+class FakeEvents:
+    def __init__(self, steam_start_cbs):
+        self.steam_start_cbs = steam_start_cbs
+
+    def on(self, name, cb):
+        if name == "steam_start":
+            self.steam_start_cbs.append(cb)
+
+    def off(self, name, cb):
+        if name == "steam_start" and cb in self.steam_start_cbs:
+            self.steam_start_cbs.remove(cb)
+
+
 class FakeCtx:
     InvalidArgument = InvalidArgument
     Unavailable = Unavailable
@@ -39,16 +52,16 @@ class FakeCtx:
     def __init__(self):
         self.log = logging.getLogger("test.ge_rr")
         self.steam_start_cbs = []
+        self.sounds = []
+        self.events = FakeEvents(self.steam_start_cbs)
         self.notes = []
         self.notify_ok = True
 
-    def on_steam_start(self, cb):
-        self.steam_start_cbs.append(cb)
-
-    def notify(self, title, body=""):
+    def notify(self, title, body="", icon="", timeout=15, sound=""):
         if not self.notify_ok:
             raise Unavailable("no Steam")
         self.notes.append((title, body))
+        self.sounds.append(sound)
 
 
 class Backend(unittest.TestCase):

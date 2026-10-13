@@ -39,7 +39,7 @@ python3 ../invasor/tools/pack_module.py ge-rr       # build, check, tests -> ge-
 python3 ../invasor/tools/install_module.py ge-rr    # or install that zip from ⚙ Settings › Install module
 ```
 
-Needs an Invasor core with `ctx.on_steam_start` and `author` support in module.json.
+Needs Invasor core v0.2.0 or newer (`ctx.events` and `author` support in module.json).
 
 ## Credits
 GE-Proton is by GloriousEggroll and its contributors, based on Valve's Proton, under its own licenses; GE-RR only
