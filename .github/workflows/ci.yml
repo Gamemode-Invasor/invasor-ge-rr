@@ -1,7 +1,7 @@
 name: CI
 
-# Tests the module against the core's current main, on every push and pull request, and every
-# Monday: that way a change in the core that breaks this module shows up within a week.
+# Tests the module against the core version in core-ref (the one it requires, see min_core in
+# module.json), on every push and pull request, and every Monday.
 on:
   push:
     branches: [main]
