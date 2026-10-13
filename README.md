@@ -12,7 +12,8 @@ to "GE-Proton" always runs the newest one: no more picking a new version in each
   read); nothing unverified is installed. It checks free space first, and refuses archives with unsafe paths.
 - **Where:** `~/.local/share/Steam/compatibilitytools.d/GE-Proton`. The new version is fully downloaded and
   extracted before it replaces the old one, so a failed update leaves the installed GE-Proton untouched.
-- **Notifications:** Steam shows one when a download starts and another when it's installed. Steam loads
+- **Notifications:** Steam shows one when a download starts and another when it's installed. The download
+  also appears in Invasor's Tasks panel (Select), with its progress. Steam loads
   compatibility tools only when it starts: **restart Steam** to use the new version.
 
 ## The tab (Library only, not in Quick Access)
@@ -39,7 +40,7 @@ python3 ../invasor/tools/pack_module.py ge-rr       # build, check, tests -> ge-
 python3 ../invasor/tools/install_module.py ge-rr    # or install that zip from ⚙ Settings › Install module
 ```
 
-Needs an Invasor core with `ctx.on_steam_start` and `author` support in module.json.
+Needs Invasor core v0.2.0 or newer (`ctx.events` and `author` support in module.json).
 
 ## Credits
 GE-Proton is by GloriousEggroll and its contributors, based on Valve's Proton, under its own licenses; GE-RR only
