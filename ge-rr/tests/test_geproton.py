@@ -33,8 +33,26 @@ RELEASE = {
 }
 
 
-def make_tar(path, files, top="GE-Proton11-7-x86_64"):
-    with tarfile.open(path, "w:gz") as tar:
+CBASE = "https://github.com/CachyOS/proton-cachyos/releases/download/cachyos-11.0-20261014-slr/"
+CTAG = "cachyos-11.0-20261014-slr"
+
+
+def casset(suffix, size=10):
+    name = f"proton-{CTAG}-{suffix}"
+    return {"name": name, "browser_download_url": CBASE + name, "size": size}
+
+
+CACHY_RELEASE = {
+    "tag_name": CTAG,
+    "assets": [casset(s) for s in ("arm64.sha512sum", "arm64.tar.xz", "x86_64.sha512sum", "x86_64.tar.xz",
+                                     "x86_64_v3.sha512sum", "x86_64_v3.tar.xz")],
+}
+V3_CPU = "processor\t: 0\nflags\t\t: fpu " + " ".join(sorted(geproton.V3_FLAGS)) + " sse2\n"
+V2_CPU = "processor\t: 0\nflags\t\t: fpu cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3 avx\n"
+
+
+def make_tar(path, files, top="GE-Proton11-7-x86_64", mode="w:gz"):
+    with tarfile.open(path, mode) as tar:
         for name, data in files.items():
             info = tarfile.TarInfo(f"{top}/{name}" if top else name)
             info.size = len(data)
@@ -51,6 +69,21 @@ class Arch(unittest.TestCase):
     def test_unsupported(self):
         with self.assertRaisesRegex(geproton.Error, "riscv64"):
             geproton.arch("riscv64")
+
+
+class Flavour(unittest.TestCase):
+    def test_ge(self):
+        self.assertEqual(geproton.flavour(geproton.GE, "x86_64", V3_CPU), "x86_64")
+        self.assertEqual(geproton.flavour(geproton.GE, "aarch64"), "aarch64")
+
+    def test_cachyos(self):
+        c = geproton.CACHYOS
+        self.assertEqual(geproton.flavour(c, "x86_64", V3_CPU), "x86_64_v3")
+        self.assertEqual(geproton.flavour(c, "x86_64", V2_CPU), "x86_64")
+        self.assertEqual(geproton.flavour(c, "x86_64", ""), "x86_64")
+        self.assertEqual(geproton.flavour(c, "aarch64"), "arm64")
+        with self.assertRaisesRegex(geproton.Error, "Proton-CachyOS isn't built"):
+            geproton.flavour(c, "riscv64")
 
 
 class PickAsset(unittest.TestCase):
@@ -73,11 +106,32 @@ class PickAsset(unittest.TestCase):
         with self.assertRaisesRegex(geproton.Error, "aarch64"):
             geproton.pick_asset(old, "aarch64")
 
+    def test_cachyos(self):
+        c = geproton.CACHYOS
+        r = geproton.pick_asset(CACHY_RELEASE, "x86_64_v3", c)
+        self.assertEqual(r["tag"], CTAG)
+        self.assertEqual(r["url"], CBASE + f"proton-{CTAG}-x86_64_v3.tar.xz")
+        self.assertEqual(r["sha512_url"], CBASE + f"proton-{CTAG}-x86_64_v3.sha512sum")
+        self.assertEqual(geproton.pick_asset(CACHY_RELEASE, "x86_64", c)["url"], CBASE + f"proton-{CTAG}-x86_64.tar.xz")
+        self.assertEqual(geproton.pick_asset(CACHY_RELEASE, "arm64", c)["url"], CBASE + f"proton-{CTAG}-arm64.tar.xz")
+
+    def test_cachyos_without_v3_falls_back(self):
+        c = geproton.CACHYOS
+        no_v3 = {**CACHY_RELEASE, "assets": [a for a in CACHY_RELEASE["assets"] if "_v3" not in a["name"]]}
+        self.assertEqual(geproton.pick_asset(no_v3, "x86_64_v3", c)["url"], CBASE + f"proton-{CTAG}-x86_64.tar.xz")
+        only_arm = {**CACHY_RELEASE, "assets": [a for a in CACHY_RELEASE["assets"] if "arm64" in a["name"]]}
+        with self.assertRaisesRegex(geproton.Error, "Proton-CachyOS has no x86_64 download"):
+            geproton.pick_asset(only_arm, "x86_64", c)  # no unsuffixed fallback as for GE
+
     def test_latest_release_reads_the_api(self):
         r = geproton.latest_release("x86_64", get=lambda url: json.dumps(RELEASE).encode())
         self.assertEqual(r["tag"], "GE-Proton11-7")
         with self.assertRaises(geproton.NetworkError):
             geproton.latest_release("x86_64", get=lambda url: b"<html>")
+        urls = []
+        r = geproton.latest_release("x86_64_v3", geproton.CACHYOS,
+                                    get=lambda url: urls.append(url) or json.dumps(CACHY_RELEASE).encode())
+        self.assertEqual((r["tag"], urls), (CTAG, [geproton.CACHYOS.api_url]))
 
 
 class Http(unittest.TestCase):
@@ -85,21 +139,21 @@ class Http(unittest.TestCase):
         headers = Message()
         if remaining is not None:
             headers["X-RateLimit-Remaining"] = remaining
-        return urllib.error.HTTPError(geproton.API_URL, code, "x", headers, None)
+        return urllib.error.HTTPError(geproton.GE.api_url, code, "x", headers, None)
 
     def test_rate_limit(self):
         with mock.patch("urllib.request.urlopen", side_effect=self._http_error(403, "0")):
             with self.assertRaisesRegex(geproton.Error, "rate limit") as cm:
-                geproton.http_get(geproton.API_URL)
+                geproton.http_get(geproton.GE.api_url)
         self.assertNotIsInstance(cm.exception, geproton.NetworkError)  # not worth retrying
 
     def test_other_errors_are_network_errors(self):
         with mock.patch("urllib.request.urlopen", side_effect=self._http_error(502, None)):
             with self.assertRaises(geproton.NetworkError):
-                geproton.http_get(geproton.API_URL)
+                geproton.http_get(geproton.GE.api_url)
         with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
             with self.assertRaisesRegex(geproton.NetworkError, "down"):
-                geproton.http_get(geproton.API_URL)
+                geproton.http_get(geproton.GE.api_url)
 
 
 class Installed(unittest.TestCase):
@@ -131,6 +185,19 @@ class Installed(unittest.TestCase):
         tool.mkdir()
         (tool / "version-GE-Proton10-3").touch()
         self.assertEqual(geproton.installed(self.root), {"tag": "GE-Proton10-3", "url": None})
+
+    def test_installed_by_hand_is_compared_by_tag(self):
+        tool = self.root / "proton-cachyos"
+        tool.mkdir()
+        (tool / "version").write_text(f"1792277004 {CTAG}\n")
+        c = geproton.CACHYOS
+        cur = geproton.installed(self.root, c)
+        self.assertEqual(cur, {"tag": CTAG, "url": None})
+        self.assertIsNone(geproton.installed(self.root))  # GE-Proton isn't there
+        self.assertFalse(geproton.needs_update(cur, geproton.pick_asset(CACHY_RELEASE, "x86_64_v3", c)))
+        newer = {**CACHY_RELEASE, "tag_name": "cachyos-11.0-20261101-slr"}
+        self.assertTrue(geproton.needs_update(cur, geproton.pick_asset(newer, "x86_64_v3", c)))
+        self.assertTrue(geproton.needs_update({"tag": None, "url": None}, geproton.pick_asset(newer, "x86_64", c)))
 
 
 class Download(unittest.TestCase):
@@ -216,6 +283,21 @@ class ExtractInstall(unittest.TestCase):
         self.assertEqual(geproton.installed(self.root), {"tag": "GE-Proton11-7", "url": self.release["url"]})
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["GE-Proton"])
 
+    def test_cachyos_tar_xz(self):
+        c = geproton.CACHYOS
+        release = geproton.pick_asset(CACHY_RELEASE, "x86_64_v3", c)
+        tar = self.base / "c.tar.xz"
+        top_name = f"proton-{CTAG}-x86_64_v3"
+        make_tar(tar, {"proton": b"#!/bin/sh\n", "version": f"1 {CTAG}\n".encode()}, top=top_name, mode="w:xz")
+        top = geproton.extract(tar, self.base / "x", tool=c)
+        self.assertEqual(top.name, top_name)
+        geproton.install(top, self.root, release, c)
+        vdf = (self.root / "proton-cachyos" / "compatibilitytool.vdf").read_text()
+        self.assertIn('"proton-cachyos" // Internal name of this tool', vdf)
+        self.assertIn('"display_name" "Proton-CachyOS"', vdf)
+        self.assertEqual(geproton.installed(self.root, c), {"tag": CTAG, "url": release["url"]})
+        self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["proton-cachyos"])
+
     def test_refuses_unsafe_archive(self):
         tar = self.base / "bad.tar.gz"
         make_tar(tar, {"../evil": b"x"}, top=None)
@@ -254,6 +336,9 @@ class ExtractInstall(unittest.TestCase):
             geproton.check_space(self.base, 25)
             with self.assertRaisesRegex(geproton.Error, "free space"):
                 geproton.check_space(self.base, 26)
+            geproton.check_space(self.base, 16, geproton.CACHYOS.space_factor)
+            with self.assertRaisesRegex(geproton.Error, "free space"):
+                geproton.check_space(self.base, 17, geproton.CACHYOS.space_factor)
 
     def test_clean_and_remove(self):
         cache = self.base / "cache"
@@ -261,6 +346,7 @@ class ExtractInstall(unittest.TestCase):
         self.assertTrue(work.name.startswith("job-"))
         (cache / "lock").touch()
         (self.root / ".GE-Proton.old").mkdir(parents=True)
+        (self.root / ".proton-cachyos.new").mkdir()
         (self.root / "GE-Proton").mkdir()
         geproton.clean(self.root, cache)
         self.assertEqual([p.name for p in cache.iterdir()], ["lock"])  # the lock stays: others may wait on it

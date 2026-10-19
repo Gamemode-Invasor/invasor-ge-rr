@@ -1,10 +1,16 @@
 {
   "api": 1,
   "name": "GE-Proton Rolling Release",
-  "version": "0.2.1",
-  "min_core": "0.2.0",
+  "version": "0.3.0",
+  "min_core": "0.2.1",
   "author": "FranjeGueje",
-  "description": "Keeps the latest GE-Proton installed as a single \"GE-Proton\" compatibility tool, checked every time Steam starts.",
+  "description": "Keeps the latest GE-Proton and Proton-CachyOS installed as single \"GE-Proton\" and \"Proton-CachyOS\" compatibility tools, checked every time Steam starts.",
   "tab": "GE-RR",
-  "no_qam": true
+  "no_qam": true,
+  "settings": [
+    { "key": "ge_enabled", "type": "toggle", "label": "GE-Proton", "default": true,
+      "hint": "Keep the latest GE-Proton installed" },
+    { "key": "cachyos_enabled", "type": "toggle", "label": "Proton-CachyOS", "default": false,
+      "hint": "Keep the latest Proton-CachyOS installed" }
+  ]
 }

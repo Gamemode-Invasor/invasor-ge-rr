@@ -1,8 +1,10 @@
-"""GE-Proton Rolling Release: find, download, verify and install the latest GE-Proton.
+"""GE-Proton Rolling Release: find, download, verify and install the latest GE-Proton
+and Proton-CachyOS.
 
 Plain functions over a Steam root and a cache folder, so the tests run on a fake tree.
-GE-Proton is always installed as compatibilitytools.d/GE-Proton, shown in Steam as
-"GE-Proton" whatever its version, so games set to it follow every update.
+Each tool is always installed in the same folder of compatibilitytools.d (GE-Proton,
+proton-cachyos), shown in Steam with the same name whatever its version, so games set
+to it follow every update.
 """
 import fcntl
 import hashlib
@@ -15,33 +17,62 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
-API_URL = "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest"
-TOOL = "GE-Proton"
 STEAM_ROOT = Path.home() / ".local/share/Steam"
 USER_AGENT = "invasor-ge-rr"
 URL_MARKER = "url_downloaded"  # same markers as ge-proton-rr.sh, so its installs are recognised
 VERSION_MARKER = "version-"
 CHUNK = 1 << 20
-SPACE_FACTOR = 4  # the tar plus GE-Proton extracted (about 3 times the tar)
 LOCK_NAME = "lock"
 WORK_PREFIX = "job-"
 
-VDF = """"compatibilitytools"
-{
+# What x86-64-v3 needs (lzcnt shows as abm), and v2 below it.
+V3_FLAGS = {"cx16", "lahf_lm", "popcnt", "sse4_1", "sse4_2", "ssse3",
+            "avx", "avx2", "bmi1", "bmi2", "f16c", "fma", "abm", "movbe", "xsave"}
+
+
+def _vdf(internal, display):
+    return f""""compatibilitytools"
+{{
   "compat_tools"
-  {
-    "GE-Proton"
-    {
+  {{
+    "{internal}" // Internal name of this tool
+    {{
       "install_path" "."
-      "display_name" "GE-Proton"
+      "display_name" "{display}"
       "from_oslist"  "windows"
       "to_oslist"    "linux"
-    }
-  }
-}
+    }}
+  }}
+}}
 """
+
+
+@dataclass(frozen=True)
+class Tool:
+    id: str  # also the settings key: <id>_enabled
+    name: str  # for messages, and Steam's display_name
+    folder: str  # in compatibilitytools.d, and the vdf's internal name
+    api_url: str
+    ext: str
+    arm: str  # how the release calls aarch64
+    v3: bool  # has x86_64_v3 builds
+    space_factor: int  # the archive plus the tool extracted, in archive sizes
+
+    @property
+    def vdf(self):
+        return _vdf(self.folder, self.name)
+
+
+GE = Tool("ge", "GE-Proton", "GE-Proton",
+          "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest",
+          ".tar.gz", "aarch64", False, 4)
+CACHYOS = Tool("cachyos", "Proton-CachyOS", "proton-cachyos",
+               "https://api.github.com/repos/CachyOS/proton-cachyos/releases/latest",
+               ".tar.xz", "arm64", True, 6)  # xz: about 5 times the archive extracted
+TOOLS = {t.id: t for t in (GE, CACHYOS)}
 
 
 class Error(Exception):
@@ -112,14 +143,36 @@ def workdir(cache=None):
     return Path(tempfile.mkdtemp(prefix=WORK_PREFIX, dir=cache))
 
 
-def arch(machine=None):
-    """The release flavour for this machine: "x86_64" or "aarch64"."""
+def arch(machine=None, tool=GE):
+    """This machine's architecture: "x86_64" or "aarch64"."""
     m = (machine if machine is not None else platform.machine()).lower()
     if m in ("x86_64", "amd64"):
         return "x86_64"
     if m in ("aarch64", "arm64"):
         return "aarch64"
-    raise Error(f"GE-Proton isn't built for this machine ({m or 'unknown'})")
+    raise Error(f"{tool.name} isn't built for this machine ({m or 'unknown'})")
+
+
+def has_v3(cpuinfo=None):
+    """True if the CPU runs x86-64-v3 code (from /proc/cpuinfo's flags)."""
+    if cpuinfo is None:
+        try:
+            cpuinfo = Path("/proc/cpuinfo").read_text()
+        except OSError:
+            return False
+    for line in cpuinfo.splitlines():
+        if line.startswith("flags"):
+            return V3_FLAGS <= set(line.partition(":")[2].split())
+    return False
+
+
+def flavour(tool=GE, machine=None, cpuinfo=None):
+    """The build of tool for this machine, as its release names it: GE-Proton "x86_64" or
+    "aarch64"; Proton-CachyOS "x86_64_v3" if the CPU runs it, else "x86_64", or "arm64"."""
+    a = arch(machine, tool)
+    if a == "aarch64":
+        return tool.arm
+    return "x86_64_v3" if tool.v3 and has_v3(cpuinfo) else a
 
 
 def _open(url, timeout):
@@ -143,21 +196,24 @@ def http_get(url, timeout=15):
             raise NetworkError(f"Connection lost ({e})") from None
 
 
-def pick_asset(release, arch_name):
-    """{tag, url, size, sha512_url, sha256} for this architecture from a GitHub release."""
+def pick_asset(release, flavour_name, tool=GE):
+    """{tag, url, size, sha512_url, sha256} for this build from a GitHub release."""
+    ext = tool.ext
     assets = {a.get("name", ""): a for a in release.get("assets") or []}
-    tars = [n for n in assets if n.endswith(".tar.gz")]
-    name = next((n for n in tars if n.endswith(f"-{arch_name}.tar.gz")), None)
-    if name is None and arch_name == "x86_64":
+    tars = [n for n in assets if n.endswith(ext)]
+    name = next((n for n in tars if n.endswith(f"-{flavour_name}{ext}")), None)
+    if name is None and flavour_name == "x86_64_v3":
+        name = next((n for n in tars if n.endswith(f"-x86_64{ext}")), None)
+    if name is None and flavour_name == "x86_64" and tool is GE:
         # Older releases had a single unsuffixed x86_64 tarball.
         name = next((n for n in tars if "aarch64" not in n), None)
     if name is None:
-        raise Error(f"The latest GE-Proton has no {arch_name} download")
+        raise Error(f"The latest {tool.name} has no {flavour_name} download")
     asset = assets[name]
-    sha = assets.get(name[: -len(".tar.gz")] + ".sha512sum")
+    sha = assets.get(name[: -len(ext)] + ".sha512sum")
     digest = asset.get("digest") or ""
     return {
-        "tag": release.get("tag_name") or name[: -len(".tar.gz")],
+        "tag": release.get("tag_name") or name[: -len(ext)],
         "url": asset["browser_download_url"],
         "size": int(asset.get("size") or 0),
         "sha512_url": sha["browser_download_url"] if sha else None,
@@ -165,40 +221,45 @@ def pick_asset(release, arch_name):
     }
 
 
-def latest_release(arch_name, get=http_get):
+def latest_release(flavour_name, tool=GE, get=http_get):
     try:
-        release = json.loads(get(API_URL))
+        release = json.loads(get(tool.api_url))
     except ValueError:
         raise NetworkError("GitHub sent an unreadable answer") from None
-    return pick_asset(release, arch_name)
+    return pick_asset(release, flavour_name, tool)
 
 
-def installed(root):
-    """{tag, url} of the GE-Proton in compatibilitytools.d, or None if there's none."""
-    tool = Path(root) / TOOL
-    if not tool.is_dir():
+def installed(root, tool=GE):
+    """{tag, url} of the tool in compatibilitytools.d, or None if there's none."""
+    folder = Path(root) / tool.folder
+    if not folder.is_dir():
         return None
     url = tag = None
     try:
-        url = (tool / URL_MARKER).read_text().strip() or None
+        url = (folder / URL_MARKER).read_text().strip() or None
     except OSError:
         pass
-    try:  # GE-Proton's own "version" file: "<timestamp> GE-ProtonX-Y"
-        tag = (tool / "version").read_text().split()[-1]
+    try:  # the tool's own "version" file: "<timestamp> <tag>"
+        tag = (folder / "version").read_text().split()[-1]
     except (OSError, IndexError):
-        marker = next(tool.glob(VERSION_MARKER + "*"), None)
+        marker = next(folder.glob(VERSION_MARKER + "*"), None)
         tag = marker.name[len(VERSION_MARKER):] if marker else None
     return {"tag": tag, "url": url}
 
 
 def needs_update(current, latest):
-    return current is None or current.get("url") != latest["url"]
+    """By the URL it was downloaded from; one installed by hand (no URL) by its version."""
+    if current is None:
+        return True
+    if current.get("url"):
+        return current["url"] != latest["url"]
+    return not current.get("tag") or current["tag"] != latest["tag"]
 
 
-def check_space(folder, size):
+def check_space(folder, size, factor=GE.space_factor):
     folder.mkdir(parents=True, exist_ok=True)
     free = shutil.disk_usage(folder).free
-    need = size * SPACE_FACTOR
+    need = size * factor
     if size and free < need:
         raise Error(f"Not enough free space: {need >> 20} MB needed, {free >> 20} MB free")
 
@@ -247,36 +308,36 @@ def verify(release, sha512, sha256, get=http_get):
     raise Error("Can't verify the download: GitHub gave no checksum")
 
 
-def extract(archive, dest, cancel=None):
+def extract(archive, dest, cancel=None, tool=GE):
     """Extract into dest (which must be empty or missing); returns the single top folder."""
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
     try:
-        with tarfile.open(archive, "r:gz") as tar:
+        with tarfile.open(archive, "r:*") as tar:
             for member in tar:
                 if cancel is not None and cancel.is_set():
                     raise Cancelled("Cancelled")
                 # "data" refuses absolute paths, "..", devices and links leaving dest.
                 tar.extract(member, dest, filter="data")
     except (tarfile.TarError, OSError) as e:
-        raise Error(f"Can't extract GE-Proton ({e})") from None
+        raise Error(f"Can't extract {tool.name} ({e})") from None
     tops = [p for p in dest.iterdir()]
     if len(tops) != 1 or not tops[0].is_dir():
-        raise Error("Unexpected GE-Proton archive (not a single folder)")
+        raise Error(f"Unexpected {tool.name} archive (not a single folder)")
     return tops[0]
 
 
-def install(extracted, root, release):
-    """Make extracted the new compatibilitytools.d/GE-Proton. The old one is swapped out
+def install(extracted, root, release, tool=GE):
+    """Make extracted the new compatibilitytools.d/<tool folder>. The old one is swapped out
     with renames and only deleted once the new one is in place."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     extracted = Path(extracted)
-    (extracted / "compatibilitytool.vdf").write_text(VDF)
+    (extracted / "compatibilitytool.vdf").write_text(tool.vdf)
     (extracted / (VERSION_MARKER + extracted.name)).touch()
     (extracted / URL_MARKER).write_text(release["url"] + "\n")
 
-    target, old, staged = root / TOOL, root / f".{TOOL}.old", root / f".{TOOL}.new"
+    target, old, staged = root / tool.folder, root / f".{tool.folder}.old", root / f".{tool.folder}.new"
     remove(old)
     remove(staged)
     if extracted.stat().st_dev != root.stat().st_dev:
@@ -286,20 +347,20 @@ def install(extracted, root, release):
         try:
             target.rename(old)
         except OSError as e:
-            raise Error(f"Can't replace the installed GE-Proton ({e})") from None
+            raise Error(f"Can't replace the installed {tool.name} ({e})") from None
     try:
         extracted.rename(target)
     except OSError as e:
         if old.exists():
             old.rename(target)
-        raise Error(f"Can't install GE-Proton ({e})") from None
+        raise Error(f"Can't install {tool.name} ({e})") from None
     finally:
         remove(staged)
     remove(old)
 
 
-def remove_installed(root):
-    remove(Path(root) / TOOL)
+def remove_installed(root, tool=GE):
+    remove(Path(root) / tool.folder)
 
 
 def clean(root, cache=None, everything=False):
@@ -311,8 +372,9 @@ def clean(root, cache=None, everything=False):
     else:
         for work in cache.glob(WORK_PREFIX + "*"):
             remove(work)
-    remove(Path(root) / f".{TOOL}.old")
-    remove(Path(root) / f".{TOOL}.new")
+    for tool in TOOLS.values():
+        remove(Path(root) / f".{tool.folder}.old")
+        remove(Path(root) / f".{tool.folder}.new")
 
 
 def remove(path):
