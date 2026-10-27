@@ -1,18 +1,20 @@
 """GE-Proton Rolling Release: find, download, verify and install the latest GE-Proton
 and Proton-CachyOS.
 
-Plain functions over a Steam root and a cache folder, so the tests run on a fake tree.
+Plain functions over a Steam root and a cache folder, so the tests run on a fake tree; the
+download and its checks are this module's own (ctx.http can't pause it when a game starts nor
+report its progress to the tab), the unpacking and the swap are the core's (passed in by backend.py).
 Each tool is always installed in the same folder of compatibilitytools.d (GE-Proton,
 proton-cachyos), shown in Steam with the same name whatever its version, so games set
 to it follow every update.
 """
 import fcntl
+import functools
 import hashlib
 import json
 import os
 import platform
 import shutil
-import tarfile
 import tempfile
 import time
 import urllib.error
@@ -20,7 +22,6 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-STEAM_ROOT = Path.home() / ".local/share/Steam"
 USER_AGENT = "invasor-ge-rr"
 URL_MARKER = "url_downloaded"  # same markers as ge-proton-rr.sh, so its installs are recognised
 VERSION_MARKER = "version-"
@@ -65,6 +66,12 @@ class Tool:
     def vdf(self):
         return _vdf(self.folder, self.name)
 
+    @property
+    def download_prefix(self):
+        """Where its release files are: https://github.com/<owner>/<repo>/releases/download/."""
+        repo = self.api_url.removeprefix("https://api.github.com/repos/").removesuffix("/releases/latest")
+        return f"https://github.com/{repo}/releases/download/"
+
 
 GE = Tool("ge", "GE-Proton", "GE-Proton",
           "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest",
@@ -87,7 +94,7 @@ class Cancelled(Error):
     pass
 
 
-def compat_dir(steam_root=STEAM_ROOT):
+def compat_dir(steam_root):
     return Path(steam_root) / "compatibilitytools.d"
 
 
@@ -153,14 +160,18 @@ def arch(machine=None, tool=GE):
     raise Error(f"{tool.name} isn't built for this machine ({m or 'unknown'})")
 
 
+@functools.cache
+def _cpuinfo():
+    """/proc/cpuinfo, read once: the tab asks for the build every time it refreshes."""
+    try:
+        return Path("/proc/cpuinfo").read_text()
+    except OSError:
+        return ""
+
+
 def has_v3(cpuinfo=None):
     """True if the CPU runs x86-64-v3 code (from /proc/cpuinfo's flags)."""
-    if cpuinfo is None:
-        try:
-            cpuinfo = Path("/proc/cpuinfo").read_text()
-        except OSError:
-            return False
-    for line in cpuinfo.splitlines():
+    for line in (_cpuinfo() if cpuinfo is None else cpuinfo).splitlines():
         if line.startswith("flags"):
             return V3_FLAGS <= set(line.partition(":")[2].split())
     return False
@@ -175,10 +186,22 @@ def flavour(tool=GE, machine=None, cpuinfo=None):
     return "x86_64_v3" if tool.v3 and has_v3(cpuinfo) else a
 
 
+class _HttpsOnly(urllib.request.HTTPRedirectHandler):
+    """Follows GitHub's redirects to its download servers, but never off https."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.lower().startswith("https://"):
+            raise urllib.error.URLError(f"redirected off https: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_HttpsOnly)
+
+
 def _open(url, timeout):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        return urllib.request.urlopen(req, timeout=timeout)
+        return _opener.open(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         e.close()
         if e.code in (403, 429) and e.headers.get("X-RateLimit-Remaining") == "0":
@@ -211,12 +234,16 @@ def pick_asset(release, flavour_name, tool=GE):
         raise Error(f"The latest {tool.name} has no {flavour_name} download")
     asset = assets[name]
     sha = assets.get(name[: -len(ext)] + ".sha512sum")
+    url, sha_url = asset.get("browser_download_url", ""), sha.get("browser_download_url", "") if sha else None
+    for u in (url, sha_url):
+        if u is not None and not u.startswith(tool.download_prefix):
+            raise Error(f"The latest {tool.name} has an unexpected download address: {u}")
     digest = asset.get("digest") or ""
     return {
         "tag": release.get("tag_name") or name[: -len(ext)],
-        "url": asset["browser_download_url"],
+        "url": url,
         "size": int(asset.get("size") or 0),
-        "sha512_url": sha["browser_download_url"] if sha else None,
+        "sha512_url": sha_url,
         "sha256": digest[len("sha256:"):] if digest.startswith("sha256:") else None,
     }
 
@@ -308,55 +335,17 @@ def verify(release, sha512, sha256, get=http_get):
     raise Error("Can't verify the download: GitHub gave no checksum")
 
 
-def extract(archive, dest, cancel=None, tool=GE):
-    """Extract into dest (which must be empty or missing); returns the single top folder."""
-    dest = Path(dest)
-    dest.mkdir(parents=True, exist_ok=True)
-    try:
-        with tarfile.open(archive, "r:*") as tar:
-            for member in tar:
-                if cancel is not None and cancel.is_set():
-                    raise Cancelled("Cancelled")
-                # "data" refuses absolute paths, "..", devices and links leaving dest.
-                tar.extract(member, dest, filter="data")
-    except (tarfile.TarError, OSError) as e:
-        raise Error(f"Can't extract {tool.name} ({e})") from None
-    tops = [p for p in dest.iterdir()]
-    if len(tops) != 1 or not tops[0].is_dir():
-        raise Error(f"Unexpected {tool.name} archive (not a single folder)")
-    return tops[0]
-
-
-def install(extracted, root, release, tool=GE):
-    """Make extracted the new compatibilitytools.d/<tool folder>. The old one is swapped out
-    with renames and only deleted once the new one is in place."""
+def install(extracted, root, release, tool, swap):
+    """Make extracted the new compatibilitytools.d/<tool folder>, with its vdf and markers.
+    swap(new, target) puts it in place in one rename (ctx.archive.swap_dir), so a failure
+    leaves the installed tool as it was."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     extracted = Path(extracted)
     (extracted / "compatibilitytool.vdf").write_text(tool.vdf)
     (extracted / (VERSION_MARKER + extracted.name)).touch()
     (extracted / URL_MARKER).write_text(release["url"] + "\n")
-
-    target, old, staged = root / tool.folder, root / f".{tool.folder}.old", root / f".{tool.folder}.new"
-    remove(old)
-    remove(staged)
-    if extracted.stat().st_dev != root.stat().st_dev:
-        shutil.move(str(extracted), staged)  # a copy across filesystems; the swap below stays a rename
-        extracted = staged
-    if target.exists() or target.is_symlink():
-        try:
-            target.rename(old)
-        except OSError as e:
-            raise Error(f"Can't replace the installed {tool.name} ({e})") from None
-    try:
-        extracted.rename(target)
-    except OSError as e:
-        if old.exists():
-            old.rename(target)
-        raise Error(f"Can't install {tool.name} ({e})") from None
-    finally:
-        remove(staged)
-    remove(old)
+    swap(extracted, root / tool.folder)
 
 
 def remove_installed(root, tool=GE):
@@ -365,16 +354,20 @@ def remove_installed(root, tool=GE):
 
 def clean(root, cache=None, everything=False):
     """Remove leftovers of interrupted runs. Only with the JobLock held: then no update is
-    running, so every work folder is a leftover. everything also removes the cache folder."""
+    running, so every work folder is a leftover. everything also removes the cache folder.
+    root None (Steam's folder wasn't found): only the cache."""
     cache = Path(cache or cache_dir())
     if everything:
         remove(cache)
     else:
         for work in cache.glob(WORK_PREFIX + "*"):
             remove(work)
-    for tool in TOOLS.values():
-        remove(Path(root) / f".{tool.folder}.old")
-        remove(Path(root) / f".{tool.folder}.new")
+    if root is None:
+        return
+    for tool in TOOLS.values():  # an interrupted swap: .<folder>.old-<tag>, .<folder>.new-<tag>
+        for pattern in (f".{tool.folder}.old*", f".{tool.folder}.new*"):
+            for leftover in Path(root).glob(pattern):
+                remove(leftover)
 
 
 def remove(path):
