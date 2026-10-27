@@ -39,8 +39,10 @@ def _set(tool, **kw):
         _state[tool.id].update(kw)
 
 
-def _root():
-    return geproton.compat_dir()
+def _root(context=None):
+    """compatibilitytools.d of Steam's folder. uninstall() passes its own context: the module
+    may be disabled, with no ctx of its own."""
+    return geproton.compat_dir((context or ctx).paths.steam_root())
 
 
 def _enabled(tool):
@@ -83,56 +85,36 @@ def uninstall(context, purge):
         context.log.warning("an update is still running: its files and the tools are left")
         return
     try:
-        geproton.clean(_root(), everything=True)
-        if purge:
+        try:
+            root = _root(context)
+        except context.Unavailable as e:  # the cache still goes
+            context.log.warning("Steam's tools are left: %s", e)
+            root = None
+        geproton.clean(root, everything=True)
+        if purge and root is not None:
             for tool in geproton.TOOLS.values():
-                current = geproton.installed(_root(), tool)
+                current = geproton.installed(root, tool)
                 if current is None or (tool is not geproton.GE and not current["url"]):
                     continue
-                geproton.remove_installed(_root(), tool)
-                context.log.info("removed %s", _root() / tool.folder)
+                geproton.remove_installed(root, tool)
+                context.log.info("removed %s", root / tool.folder)
     finally:
         lock.release()
 
 
 def _game_running():
-    try:
-        return bool(ctx.game.running)
-    except AttributeError:
-        return False
+    return ctx.game.running is not None
 
 
-def _notify(title, body):
+def _core(stop, what, tool, fn, *args, **kw):
+    """A ctx.archive call with its errors as the module's: cancelled while `stop` is set is a
+    pause (Cancelled), anything else a failure fit for the user (Error)."""
     try:
-        ctx.notify(title, body, sound="toast")
+        return fn(*args, **kw)
     except (ctx.Unavailable, ctx.InvalidArgument) as e:
-        ctx.log.warning("notification not shown: %s", e)  # plan B: the log
-
-
-def _task(label):
-    """The download in the Tasks panel. The core notifies when it starts (title: the label)
-    and ends (body: the final text). None if it can't be shown: then the module sends those
-    notifications itself."""
-    try:
-        return ctx.task(label)
-    except ctx.Unavailable as e:
-        ctx.log.warning("task not shown: %s", e)
-        _notify(label, "")
-        return None
-
-
-def _task_update(task, fraction, text):
-    if task:
-        task.update(fraction, text)
-
-
-def _task_end(task, label, ok, text):
-    """End the task, or without one (plan B) notify as its end would have. Nothing before
-    the download started (label None): no toast for a check that failed at boot."""
-    if task:
-        (task.done if ok else task.fail)(text)
-    elif label:
-        _notify(label, text)
+        if stop.is_set():
+            raise geproton.Cancelled("Cancelled") from None
+        raise geproton.Error(f"Can't {what} {tool.name} ({e})") from None
 
 
 def _latest(tool, stop, retry=False):
@@ -157,9 +139,16 @@ def _job(stop, tools, force, auto):
             if not stop.is_set():
                 ctx.log.warning("another update is still running; skipped")
             return
-        geproton.clean(_root())  # leftovers of interrupted runs: no other update is running now
+        try:
+            root = _root()
+        except ctx.Unavailable as e:  # Steam's folder wasn't found
+            ctx.log.warning("%s", e)
+            for tool in tools:
+                _set(tool, phase="error", error=str(e))
+            return
+        geproton.clean(root)  # leftovers of interrupted runs: no other update is running now
         for tool in tools:
-            if stop.is_set() or not _update(tool, stop, force, auto):
+            if stop.is_set() or not _update(tool, root, stop, force, auto):
                 break  # cancelled: the rest waits for the next time
     finally:
         lock.release()
@@ -167,12 +156,10 @@ def _job(stop, tools, force, auto):
         _lock.release()
 
 
-def _update(tool, stop, force, auto):
+def _update(tool, root, stop, force, auto):
     """Check and install one tool, with the JobLock held. False if it was cancelled."""
-    label = None  # the task's, once the download starts
-    root = _root()
     work = None
-    task = None
+    task = None  # opened when the download starts: a check that fails at boot shows no toast
     name = tool.name
     try:
         _set(tool, phase="checking", error=None, done=0, total=0)
@@ -188,9 +175,8 @@ def _update(tool, stop, force, auto):
         work = geproton.workdir(cache)
         ctx.log.info("downloading %s", latest["url"])
         _set(tool, phase="downloading", tag=latest["tag"], total=latest["size"])
-        label = f"{name} update: {latest['tag']} ({latest['size'] >> 20} MB)"
-        task = _task(label)
-        _task_update(task, 0, "Downloading")
+        task = ctx.task(f"{name} update: {latest['tag']} ({latest['size'] >> 20} MB)")
+        task.update(0, "Downloading")
         percent = [-1]
 
         def progress(done, total):
@@ -198,39 +184,42 @@ def _update(tool, stop, force, auto):
             pc = done * 100 // total if total else -1
             if pc != percent[0]:  # one update per percent, not per chunk
                 percent[0] = pc
-                _task_update(task, done / total if total else None,
-                             f"Downloading {done >> 20}/{total >> 20} MB" if total else "Downloading")
+                task.update(done / total if total else None,
+                            f"Downloading {done >> 20}/{total >> 20} MB" if total else "Downloading")
 
         archive = work / f"{tool.folder}{tool.ext}"
         sha512, sha256 = geproton.download(latest["url"], archive, latest["size"],
                                            progress=progress, cancel=stop)
         _set(tool, phase="verifying")
-        _task_update(task, None, "Verifying")
+        task.update(None, "Verifying")
         how = geproton.verify(latest, sha512, sha256)
         ctx.log.info("checksum OK (%s)", how)
         _set(tool, phase="extracting")
-        _task_update(task, None, "Extracting")
-        extracted = geproton.extract(archive, work / "extract", cancel=stop, tool=tool)
+        task.update(None, "Extracting")
+        limit = {"max_bytes": latest["size"] * tool.space_factor} if latest["size"] else {}  # else the core's
+        extracted = _core(stop, "extract", tool, ctx.archive.extract, archive, work / "extract", single_root=True,
+                          symlinks="inside", cancel=stop, **limit)
         archive.unlink()
         _set(tool, phase="installing")
-        _task_update(task, None, "Installing")
-        geproton.install(extracted, root, latest, tool)
+        task.update(None, "Installing")
+        _core(stop, "install", tool, geproton.install, extracted, root, latest, tool, ctx.archive.swap_dir)
         ctx.log.info("installed %s in %s", latest["tag"], root / tool.folder)
         _set(tool, phase="done", restart=True)
-        _task_end(task, label, True, "Installed. Restart Steam to load it.")
+        task.done("Installed. Restart Steam to load it.")
     except geproton.Cancelled:
         paused = _pending and not _stop.is_set()
         _set(tool, phase="idle")
-        _task_end(task, label, False, "Paused: a game is running" if paused else "Cancelled")
+        if task:
+            task.fail("Paused: a game is running" if paused else "Cancelled")
         return False
-    except geproton.Error as e:
-        ctx.log.warning("%s: %s", name, e)
-        _set(tool, phase="error", error=str(e))
-        _task_end(task, label, False, f"Update failed: {e}")
     except Exception as e:
-        ctx.log.exception("%s update failed", name)
+        if isinstance(e, (geproton.Error, ctx.Unavailable)):  # Unavailable: ctx.task, once the module is unloaded
+            ctx.log.warning("%s: %s", name, e)
+        else:
+            ctx.log.exception("%s update failed", name)
         _set(tool, phase="error", error=str(e))
-        _task_end(task, label, False, f"Update failed: {e}")
+        if task:
+            task.fail(f"Update failed: {e}")
     finally:
         if task:
             task.fail("Interrupted")  # no-op if it already ended
@@ -304,9 +293,13 @@ def status():
     with _state_lock:
         state = {t: dict(v) for t, v in _state.items()}
     tools = {}
+    try:
+        root = _root()
+    except ctx.Unavailable:  # Steam's folder wasn't found: nothing shows as installed
+        root = None
     for tid, tool in geproton.TOOLS.items():
         s = state[tid]
-        current = geproton.installed(_root(), tool)
+        current = geproton.installed(root, tool) if root else None
         try:
             flavour = geproton.flavour(tool)
         except geproton.Error:
@@ -320,7 +313,7 @@ def check(tool):
     """Ask GitHub for the latest build of a tool (doesn't download anything)."""
     t = _tool(tool)
     try:
-        latest = geproton.latest_release(geproton.flavour(t), t)
+        latest = _latest(t, _stop)
     except geproton.Error as e:
         raise ctx.Unavailable(str(e)) from None
     _set(t, latest=latest, checked=time.strftime("%H:%M"))

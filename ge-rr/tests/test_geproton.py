@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 import geproton
+from invasor import archive, schema
 
 BASE = "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton11-7/"
 
@@ -51,12 +52,22 @@ V3_CPU = "processor\t: 0\nflags\t\t: fpu " + " ".join(sorted(geproton.V3_FLAGS))
 V2_CPU = "processor\t: 0\nflags\t\t: fpu cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3 avx\n"
 
 
-def make_tar(path, files, top="GE-Proton11-7-x86_64", mode="w:gz"):
+def make_tar(path, files, top="GE-Proton11-7-x86_64", mode="w:gz", links=None):
+    """files: {name: bytes}; links: {name: target} (symbolic)."""
     with tarfile.open(path, mode) as tar:
         for name, data in files.items():
             info = tarfile.TarInfo(f"{top}/{name}" if top else name)
             info.size = len(data)
             tar.addfile(info, io.BytesIO(data))
+        for name, target in (links or {}).items():
+            info = tarfile.TarInfo(f"{top}/{name}" if top else name)
+            info.type, info.linkname = tarfile.SYMTYPE, target
+            tar.addfile(info)
+
+
+def extract(tar, dest):
+    """What backend.py runs: the core's extract, with the options it passes."""
+    return archive.extract(tar, dest, single_root=True, symlinks="inside")
 
 
 class Arch(unittest.TestCase):
@@ -115,6 +126,19 @@ class PickAsset(unittest.TestCase):
         self.assertEqual(geproton.pick_asset(CACHY_RELEASE, "x86_64", c)["url"], CBASE + f"proton-{CTAG}-x86_64.tar.xz")
         self.assertEqual(geproton.pick_asset(CACHY_RELEASE, "arm64", c)["url"], CBASE + f"proton-{CTAG}-arm64.tar.xz")
 
+    def test_only_the_repositorys_own_downloads(self):
+        self.assertEqual(geproton.GE.download_prefix, "https://github.com/GloriousEggroll/proton-ge-custom/releases/download/")
+        self.assertEqual(geproton.CACHYOS.download_prefix, "https://github.com/CachyOS/proton-cachyos/releases/download/")
+        for bad in ("https://evil.example/", "http://github.com/GloriousEggroll/proton-ge-custom/releases/download/x/",
+                    "https://github.com/someone/proton-ge-custom/releases/download/x/"):
+            for which in ("tar.gz", "sha512sum"):
+                with self.subTest(bad=bad, which=which):
+                    release = {"tag_name": "GE-Proton11-7", "assets": [
+                        {"name": n, "size": 1, "browser_download_url": (bad if n.endswith(which) else BASE) + n}
+                        for n in ("GE-Proton11-7-x86_64.tar.gz", "GE-Proton11-7-x86_64.sha512sum")]}
+                    with self.assertRaisesRegex(geproton.Error, "unexpected download address"):
+                        geproton.pick_asset(release, "x86_64")
+
     def test_cachyos_without_v3_falls_back(self):
         c = geproton.CACHYOS
         no_v3 = {**CACHY_RELEASE, "assets": [a for a in CACHY_RELEASE["assets"] if "_v3" not in a["name"]]}
@@ -142,16 +166,32 @@ class Http(unittest.TestCase):
         return urllib.error.HTTPError(geproton.GE.api_url, code, "x", headers, None)
 
     def test_rate_limit(self):
-        with mock.patch("urllib.request.urlopen", side_effect=self._http_error(403, "0")):
+        with mock.patch.object(geproton._opener, "open", side_effect=self._http_error(403, "0")):
             with self.assertRaisesRegex(geproton.Error, "rate limit") as cm:
                 geproton.http_get(geproton.GE.api_url)
         self.assertNotIsInstance(cm.exception, geproton.NetworkError)  # not worth retrying
 
+    def test_redirects_never_leave_https(self):
+        handler = geproton._HttpsOnly()
+        req = urllib.request.Request("https://github.com/x/y/releases/download/t/a.tar.gz")
+        with self.assertRaisesRegex(urllib.error.URLError, "off https"):
+            handler.redirect_request(req, None, 302, "Found", {}, "http://evil.example/a.tar.gz")
+        ok = handler.redirect_request(req, None, 302, "Found", {}, "https://objects.githubusercontent.com/a")
+        self.assertEqual(ok.full_url, "https://objects.githubusercontent.com/a")
+
+    def test_the_cpu_is_read_once(self):
+        geproton._cpuinfo.cache_clear()
+        self.addCleanup(geproton._cpuinfo.cache_clear)
+        with mock.patch.object(Path, "read_text", return_value="flags\t: " + " ".join(geproton.V3_FLAGS)) as read:
+            self.assertTrue(geproton.has_v3())
+            self.assertTrue(geproton.has_v3())
+        read.assert_called_once()
+
     def test_other_errors_are_network_errors(self):
-        with mock.patch("urllib.request.urlopen", side_effect=self._http_error(502, None)):
+        with mock.patch.object(geproton._opener, "open", side_effect=self._http_error(502, None)):
             with self.assertRaises(geproton.NetworkError):
                 geproton.http_get(geproton.GE.api_url)
-        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
+        with mock.patch.object(geproton._opener, "open", side_effect=urllib.error.URLError("down")):
             with self.assertRaisesRegex(geproton.NetworkError, "down"):
                 geproton.http_get(geproton.GE.api_url)
 
@@ -218,21 +258,21 @@ class Download(unittest.TestCase):
     def test_hashes_and_progress(self):
         data = b"x" * (geproton.CHUNK + 5)
         seen = []
-        with mock.patch("urllib.request.urlopen", return_value=self._response(data)):
+        with mock.patch.object(geproton._opener, "open", return_value=self._response(data)):
             h = geproton.download("https://x/u", self.dest, progress=lambda d, t: seen.append((d, t)))
         self.assertEqual(h, (hashlib.sha512(data).hexdigest(), hashlib.sha256(data).hexdigest()))
         self.assertEqual(self.dest.read_bytes(), data)
         self.assertEqual(seen[-1], (len(data), len(data)))
 
     def test_incomplete(self):
-        with mock.patch("urllib.request.urlopen", return_value=self._response(b"abc", 10)):
+        with mock.patch.object(geproton._opener, "open", return_value=self._response(b"abc", 10)):
             with self.assertRaisesRegex(geproton.NetworkError, "incomplete"):
                 geproton.download("https://x/u", self.dest)
 
     def test_cancel(self):
         stop = threading.Event()
         stop.set()
-        with mock.patch("urllib.request.urlopen", return_value=self._response(b"abc")):
+        with mock.patch.object(geproton._opener, "open", return_value=self._response(b"abc")):
             with self.assertRaises(geproton.Cancelled):
                 geproton.download("https://x/u", self.dest, cancel=stop)
 
@@ -269,15 +309,17 @@ class ExtractInstall(unittest.TestCase):
 
     def test_extract_and_install(self):
         tar = self.base / "g.tar.gz"
-        make_tar(tar, {"proton": b"#!/bin/sh\n", "version": b"1 GE-Proton11-7\n"})
-        top = geproton.extract(tar, self.base / "x")
+        make_tar(tar, {"proton": b"#!/bin/sh\n", "version": b"1 GE-Proton11-7\n", "lib/libx.so.1.2": b"x"},
+                 links={"lib/libx.so.1": "libx.so.1.2"})
+        top = extract(tar, self.base / "x")
         self.assertEqual(top.name, "GE-Proton11-7-x86_64")
         old = self.root / "GE-Proton"
         old.mkdir(parents=True)
         (old / "stale").touch()
-        geproton.install(top, self.root, self.release)
+        geproton.install(top, self.root, self.release, geproton.GE, archive.swap_dir)
         tool = self.root / "GE-Proton"
         self.assertFalse((tool / "stale").exists())
+        self.assertEqual((tool / "lib/libx.so.1").read_bytes(), b"x")  # Proton's own relative links stay
         self.assertIn('"display_name" "GE-Proton"', (tool / "compatibilitytool.vdf").read_text())
         self.assertTrue((tool / "version-GE-Proton11-7-x86_64").exists())
         self.assertEqual(geproton.installed(self.root), {"tag": "GE-Proton11-7", "url": self.release["url"]})
@@ -289,46 +331,42 @@ class ExtractInstall(unittest.TestCase):
         tar = self.base / "c.tar.xz"
         top_name = f"proton-{CTAG}-x86_64_v3"
         make_tar(tar, {"proton": b"#!/bin/sh\n", "version": f"1 {CTAG}\n".encode()}, top=top_name, mode="w:xz")
-        top = geproton.extract(tar, self.base / "x", tool=c)
+        top = extract(tar, self.base / "x")
         self.assertEqual(top.name, top_name)
-        geproton.install(top, self.root, release, c)
+        geproton.install(top, self.root, release, c, archive.swap_dir)
         vdf = (self.root / "proton-cachyos" / "compatibilitytool.vdf").read_text()
         self.assertIn('"proton-cachyos" // Internal name of this tool', vdf)
         self.assertIn('"display_name" "Proton-CachyOS"', vdf)
         self.assertEqual(geproton.installed(self.root, c), {"tag": CTAG, "url": release["url"]})
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["proton-cachyos"])
 
-    def test_refuses_unsafe_archive(self):
-        tar = self.base / "bad.tar.gz"
-        make_tar(tar, {"../evil": b"x"}, top=None)
-        with self.assertRaises(geproton.Error):
-            geproton.extract(tar, self.base / "x")
+    def test_unsafe_archives_are_refused(self):
+        cases = {"traversal": ({"../evil": b"x"}, None, None),
+                 "several folders": ({"a/f": b"1", "b/f": b"2"}, None, None),
+                 "link leaving it": ({"f": b"1"}, "GE-Proton11-7-x86_64", {"out": "../../outside"}),
+                 "absolute link": ({"f": b"1"}, "GE-Proton11-7-x86_64", {"out": "/etc/passwd"})}
+        for case, (files, top, links) in cases.items():
+            with self.subTest(case):
+                tar = self.base / f"{case}.tar.gz"
+                make_tar(tar, files, top=top, links=links)
+                with self.assertRaises(schema.InvalidArgument):
+                    extract(tar, self.base / case)
+                self.assertFalse((self.base / case).exists())
         self.assertFalse((self.base / "evil").exists())
 
-    def test_refuses_several_folders(self):
-        tar = self.base / "two.tar.gz"
-        make_tar(tar, {"a/f": b"1", "b/f": b"2"}, top=None)
-        with self.assertRaisesRegex(geproton.Error, "single folder"):
-            geproton.extract(tar, self.base / "x")
-
-    def test_failed_install_restores_the_old_one(self):
+    def test_failed_swap_leaves_the_installed_one(self):
         new = self.base / "new"
         new.mkdir()
         old = self.root / "GE-Proton"
         old.mkdir(parents=True)
         (old / "keep").touch()
-        real_rename = Path.rename
 
-        def rename(self_, target):
-            if self_ == new:
-                raise OSError("disk on fire")
-            return real_rename(self_, target)
+        def swap(src, target):
+            raise schema.Unavailable("disk on fire")
 
-        with mock.patch.object(Path, "rename", rename):
-            with self.assertRaisesRegex(geproton.Error, "disk on fire"):
-                geproton.install(new, self.root, self.release)
-        self.assertTrue((old / "keep").exists())
-        self.assertFalse((self.root / ".GE-Proton.old").exists())
+        with self.assertRaisesRegex(schema.Unavailable, "disk on fire"):
+            geproton.install(new, self.root, self.release, geproton.GE, swap)
+        self.assertEqual(sorted(p.name for p in old.iterdir()), ["keep"])
 
     def test_check_space(self):
         free = mock.Mock(free=100)
@@ -345,8 +383,10 @@ class ExtractInstall(unittest.TestCase):
         work = geproton.workdir(cache)
         self.assertTrue(work.name.startswith("job-"))
         (cache / "lock").touch()
-        (self.root / ".GE-Proton.old").mkdir(parents=True)
+        (self.root / ".GE-Proton.old").mkdir(parents=True)  # older versions of this module
         (self.root / ".proton-cachyos.new").mkdir()
+        (self.root / ".GE-Proton.old-1a2b3c4d").mkdir()  # an interrupted ctx.archive.swap_dir
+        (self.root / ".proton-cachyos.new-5e6f7a8b").mkdir()
         (self.root / "GE-Proton").mkdir()
         geproton.clean(self.root, cache)
         self.assertEqual([p.name for p in cache.iterdir()], ["lock"])  # the lock stays: others may wait on it

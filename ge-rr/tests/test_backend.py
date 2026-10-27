@@ -28,12 +28,9 @@ def load_backend():
     return mod
 
 
-class InvalidArgument(ValueError):
-    pass
+from invasor import archive, schema  # noqa: E402
 
-
-class Unavailable(RuntimeError):
-    pass
+InvalidArgument, Unavailable = schema.InvalidArgument, schema.Unavailable
 
 
 class FakeEvents:
@@ -68,7 +65,7 @@ class FakeSettings:
 
 
 class FakeTask:
-    """As in core 0.2.1, it notifies when it starts (the label) and ends (the label and final text)."""
+    """As the core's: it notifies when it starts (the label) and ends (the label and final text)."""
 
     def __init__(self, label, notes):
         self.label, self.updates, self.end, self.notes = label, [], None, notes
@@ -98,13 +95,13 @@ class FakeCtx:
         self.log = logging.getLogger("test.ge_rr")
         self.cbs = {}
         self.game = types.SimpleNamespace(running=None)
-        self.sounds = []
         self.tasks = []
         self.task_ok = True
         self.events = FakeEvents(self.cbs)
         self.settings = FakeSettings()
         self.notes = []
-        self.notify_ok = True
+        self.paths = types.SimpleNamespace(steam_root=lambda: Path("/steam"))
+        self.archive = types.SimpleNamespace(extract=None, swap_dir=archive.swap_dir)  # extract: set by the test
 
     def task(self, label, notify=True, sound="toast"):
         if not self.task_ok:
@@ -112,12 +109,6 @@ class FakeCtx:
         t = FakeTask(label, self.notes if notify else [])
         self.tasks.append(t)
         return t
-
-    def notify(self, title, body="", icon="", timeout=15, sound=""):
-        if not self.notify_ok:
-            raise Unavailable("no Steam")
-        self.notes.append((title, body))
-        self.sounds.append(sound)
 
 
 class Backend(unittest.TestCase):
@@ -136,12 +127,12 @@ class Backend(unittest.TestCase):
             mock.patch.object(g, "check_space"),
             mock.patch.object(g, "download", side_effect=self._download),
             mock.patch.object(g, "verify", return_value="sha512"),
-            mock.patch.object(g, "extract", side_effect=self._extract),
         ]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
         self.ctx = FakeCtx()
+        self.ctx.archive.extract = mock.Mock(side_effect=self._extract)
         self.b.setup(self.ctx)
 
     def tearDown(self):
@@ -153,8 +144,9 @@ class Backend(unittest.TestCase):
         progress(100, 100)
         return "a", "b"
 
-    def _extract(self, archive, dest, cancel=None, tool=None):
-        tag = LATEST["tag"] if tool is self.b.geproton.GE else CTAG
+    def _extract(self, archive, dest, single_root=False, symlinks="refuse", cancel=None, max_bytes=None):
+        """ctx.archive.extract of a downloaded tool (its archive is named after its folder)."""
+        tag = LATEST["tag"] if Path(archive).name.startswith(self.b.geproton.GE.folder) else CTAG
         top = Path(dest) / tag
         top.mkdir(parents=True)
         (top / "version").write_text(f"1 {tag}\n")
@@ -203,14 +195,63 @@ class Backend(unittest.TestCase):
         self.b.auto_update()
         self.assertEqual(self.ctx.tasks, [])
 
-    def test_task_plan_b(self):
-        self.ctx.task_ok = False
-        with self.assertLogs("test.ge_rr", "INFO") as logs:
+    def test_an_unexpected_failure_is_logged_with_its_traceback(self):
+        self.b.geproton.check_space.side_effect = RuntimeError("bug")
+        with self.assertLogs("test.ge_rr", "WARNING") as logs:
             self.b.auto_update()
+        self.assertEqual(self.b.status()["tools"]["ge"]["phase"], "error")
+        self.assertIn("Traceback", "\n".join(logs.output))
+        self.b.geproton.check_space.side_effect = self.b.geproton.Error("Not enough free space")
+        with self.assertLogs("test.ge_rr", "WARNING") as logs:
+            self.b.auto_update()
+        self.assertNotIn("Traceback", "\n".join(logs.output))
+        self.assertEqual(self.b.status()["tools"]["ge"]["error"], "Not enough free space")
+
+    def test_no_task_is_a_failed_update(self):
+        self.ctx.task_ok = False
+        with self.assertLogs("test.ge_rr", "WARNING"):
+            self.b.auto_update()
+        self.assertEqual(self.b.status()["tools"]["ge"]["phase"], "error")
+        self.assertIsNone(self.b.status()["tools"]["ge"]["installed"])
+
+    def test_extraction_uses_the_core_with_links_inside_and_a_size_limit(self):
+        self.b.auto_update()
+        kw = self.ctx.archive.extract.call_args.kwargs
+        self.assertEqual((kw["single_root"], kw["symlinks"]), (True, "inside"))
+        self.assertEqual(kw["max_bytes"], LATEST["size"] * self.b.geproton.GE.space_factor)
+        self.assertIsNotNone(kw["cancel"])
+
+    def test_a_bad_archive_is_an_error_and_a_cancelled_extraction_a_pause(self):
+        self.ctx.archive.extract.side_effect = InvalidArgument("unsafe path ../x")
+        with self.assertLogs("test.ge_rr", "WARNING"):
+            self.b.auto_update()
+        ge = self.b.status()["tools"]["ge"]
+        self.assertEqual((ge["phase"], ge["installed"]), ("error", None))
+        self.assertIn("Can't extract GE-Proton (unsafe path ../x)", ge["error"])
+
+        def cancelled(*args, cancel=None, **kw):
+            cancel.set()  # a game started meanwhile
+            raise Unavailable("cancelled")
+
+        self.ctx.archive.extract.side_effect = cancelled
+        self.b.auto_update()
+        self.assertEqual(self.b.status()["tools"]["ge"]["phase"], "idle")
+        self.assertEqual(self.ctx.tasks[-1].end, ("fail", "Cancelled"))
+
+    def test_steam_folder_not_found(self):
+        self.ctx.paths.steam_root = mock.Mock(side_effect=Unavailable("Steam's folder wasn't found"))
+        with self.assertLogs("test.ge_rr", "WARNING"):
+            self.b.auto_update()
+        ge = self.b.status()["tools"]["ge"]  # the tab still shows the tools, with the error
+        self.assertEqual((ge["phase"], ge["installed"], ge["update_available"]), ("error", None, False))
+        self.assertIn("Steam's folder wasn't found", ge["error"])
+        self.assertEqual(self.ctx.tasks, [])
+
+    def test_no_size_from_github_leaves_the_cores_byte_limit(self):
+        self.b.geproton.latest_release.side_effect = lambda flavour, tool: dict(LATEST, size=0)
+        self.b.auto_update()
+        self.assertNotIn("max_bytes", self.ctx.archive.extract.call_args.kwargs)
         self.assertEqual(self.b.status()["tools"]["ge"]["phase"], "done")
-        self.assertTrue(any("task not shown" in line for line in logs.output))
-        # the module notifies as the task would have
-        self.assertEqual(self.ctx.notes, [("GE-Proton update: GE-Proton11-7 (0 MB)", ""), ("GE-Proton update: GE-Proton11-7 (0 MB)", "Installed. Restart Steam to load it.")])
 
     def test_up_to_date_does_nothing(self):
         self.b.auto_update()
@@ -317,14 +358,6 @@ class Backend(unittest.TestCase):
         self.assertEqual(self.b.status()["tools"]["ge"]["phase"], "error")
         self.assertEqual(self.ctx.notes, [])
 
-    def test_notification_plan_b(self):
-        self.ctx.task_ok = False
-        self.ctx.notify_ok = False
-        with self.assertLogs("test.ge_rr", "INFO") as logs:
-            self.b.auto_update()
-        self.assertEqual(self.b.status()["tools"]["ge"]["phase"], "done")
-        self.assertTrue(any("notification not shown" in line for line in logs.output))
-
     def test_waits_for_an_old_instance(self):
         """After a reload, the old instance's update may still hold the JobLock: the new one
         waits for it instead of downloading into the same place at the same time."""
@@ -380,6 +413,21 @@ class Backend(unittest.TestCase):
         self.b.uninstall(self.ctx, purge=True)
         self.assertFalse((self.root / "GE-Proton").exists())
         self.assertFalse(self.cache.exists())
+
+    def test_uninstall_of_a_disabled_module_uses_its_own_context(self):
+        self.b.auto_update()
+        self.b.teardown()
+        self.b.ctx = None  # disabled: uninstall() runs without setup()
+        self.b.uninstall(self.ctx, purge=True)
+        self.assertFalse((self.root / "GE-Proton").exists())
+
+    def test_uninstall_without_steam_folder_removes_nothing(self):
+        self.b.auto_update()
+        self.ctx.paths.steam_root = mock.Mock(side_effect=Unavailable("Steam's folder wasn't found"))
+        with self.assertLogs("test.ge_rr", "WARNING"):
+            self.b.uninstall(self.ctx, purge=True)
+        self.assertTrue((self.root / "GE-Proton").is_dir())
+        self.assertFalse(self.cache.exists())  # the cache goes anyway
 
 
     # --- Proton-CachyOS, and the Enabled switches
